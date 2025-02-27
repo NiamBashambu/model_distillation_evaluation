@@ -21,27 +21,31 @@ teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
 distilled_model = AutoModelForCausalLM.from_pretrained(distilled_model_path).to(device)
 distilled_tokenizer = AutoTokenizer.from_pretrained(distilled_model_path)
 
-# Define task configurations for classification benchmarks
+# Define task configurations with label_field
 task_configs = {
     "SuperGLUE_cb": {
         "prompt_template": "Premise: {premise} Hypothesis: {hypothesis} The relationship is",
         "label_map": {0: "entailment", 1: "contradiction", 2: "neutral"},
-        "input_fields": ["premise", "hypothesis"]
+        "input_fields": {"premise": "premise", "hypothesis": "hypothesis"},
+        "label_field": "label"
     },
     "GLUE_mrpc": {
         "prompt_template": "Sentence1: {sentence1} Sentence2: {sentence2} Are they equivalent or not equivalent? The answer is",
         "label_map": {0: "not equivalent", 1: "equivalent"},
-        "input_fields": ["sentence1", "sentence2"]
+        "input_fields": {"sentence1": "sentence1", "sentence2": "sentence2"},
+        "label_field": "label"
     },
     "XTREME_XNLI": {
         "prompt_template": "Premise: {premise} Hypothesis: {hypothesis} The relationship is",
         "label_map": {0: "entailment", 1: "neutral", 2: "contradiction"},
-        "input_fields": ["premise", "hypothesis"]
+        "input_fields": {"premise": "sentence1", "hypothesis": "sentence2"},
+        "label_field": "gold_label"
     },
     "TREC": {
         "prompt_template": "Classify this question: {text} into one of: abbreviation, entity, description, human, location, numeric. The category is",
         "label_map": {0: "abbreviation", 1: "entity", 2: "description", 3: "human", 4: "location", 5: "numeric"},
-        "input_fields": ["text"]
+        "input_fields": {"text": "text"},
+        "label_field": "coarse_label"
     }
 }
 
@@ -69,25 +73,33 @@ def evaluate_model(model, tokenizer, benchmark, task_config):
     total = 0
     for example in dataset:
         # Construct prompt
-        input_data = {field: example[field] for field in task_config["input_fields"]}
+        input_data = {prompt_var: example[dataset_field] for prompt_var, dataset_field in task_config["input_fields"].items()}
         prompt = task_config["prompt_template"].format(**input_data)
-        prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-        # Get true label
-        true_label = example["label"]
+        # Get true label using the specified label_field
+        true_label = example[task_config["label_field"]]
+
+        # Convert string labels to integers for XTREME_XNLI
+        if benchmark["name"] == "XTREME_XNLI":
+            label_str_to_int = {"entailment": 0, "neutral": 1, "contradiction": 2}
+            true_label = label_str_to_int[true_label]
 
         # Compute loss for each verbalizer
-        losses = []
-        verbalizers = list(task_config["label_map"].values())
-        for verbalizer in verbalizers:
-            verbalizer_ids = tokenizer.encode(verbalizer, return_tensors="pt").to(device)
+        verbalizer_losses = []
+        for label_idx, verbalizer in task_config["label_map"].items():
+            verbalizer_ids = tokenizer.encode(verbalizer, add_special_tokens=False)
+            input_ids = prompt_ids + verbalizer_ids
+            input_ids_tensor = torch.tensor([input_ids]).to(device)
+            labels = [-100] * len(prompt_ids) + verbalizer_ids
+            labels_tensor = torch.tensor([labels]).to(device)
             with torch.no_grad():
-                outputs = model(input_ids=prompt_ids, labels=verbalizer_ids)
-                loss = outputs.loss.item()  # Negative average log prob
-            losses.append(loss)
+                outputs = model(input_ids=input_ids_tensor, labels=labels_tensor)
+                loss = outputs.loss.item()
+            verbalizer_losses.append(loss)
 
-        # Predict label with smallest loss (highest probability)
-        pred_idx = np.argmin(losses)
+        # Predict label with smallest loss
+        pred_idx = np.argmin(verbalizer_losses)
         pred_label = list(task_config["label_map"].keys())[pred_idx]
         if pred_label == true_label:
             correct += 1
