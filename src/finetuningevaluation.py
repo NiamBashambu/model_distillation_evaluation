@@ -32,10 +32,10 @@ task_config_finqa = {
 
 # Define benchmark for FinQA
 benchmark_finqa = {
-    "name": "FinQA",
-    "dataset": "finqa",
+    "name": "TheFinAI/Fino1_Reasoning_Path_FinQA",
+    "dataset": "TheFinAI/Fino1_Reasoning_Path_FinQA",
     "config": None,
-    "split": "validation"  # Change to 'test' if you want to use the test split
+    "split": "train" 
 }
 
 # Function to compute token-level F1 score
@@ -120,3 +120,7 @@ def evaluate_on_finqa():
     df = pd.DataFrame(results_data)
     df.to_csv("finqa_benchmark_results.csv", index=False)
     print("Evaluation completed. Results saved to 'finqa_benchmark_results.csv'")
+
+
+if __name__ == "__main__":
+    evaluate_on_finqa()
