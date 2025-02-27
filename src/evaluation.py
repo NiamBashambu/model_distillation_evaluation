@@ -1,80 +1,127 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
-from sklearn.metrics import accuracy_score
+import numpy as np
 import pandas as pd
 
-# List of benchmark tasks and datasets
-benchmarks = [
-    ("SuperGLUE", "super_glue", "cb"),
-    ("GLUE", "glue", "mrpc"),
-    ("XTREME", "xtreme", "XTRA_XX"),
-    ("SQuAD", "squad", "train"),
-    ("Conll-03", "conll2003", "test"),
-    ("WMT", "wmt14", "train"),
-    ("TREC", "trec", "train")
-]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Load models
+# Load models and tokenizers
 teacher_model_name = "EleutherAI/gpt-neo-1.3B"
 distilled_model_path = "./distilled_student_model"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_name, torch_dtype=torch.bfloat16, device_map="auto")
+# Teacher model with bfloat16 to save memory
+teacher_model = AutoModelForCausalLM.from_pretrained(
+    teacher_model_name, torch_dtype=torch.bfloat16
+).to(device)
 teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
 
-distilled_model = AutoModelForCausalLM.from_pretrained(distilled_model_path)
+# Distilled model (assuming same tokenizer unless specified otherwise)
+distilled_model = AutoModelForCausalLM.from_pretrained(distilled_model_path).to(device)
 distilled_tokenizer = AutoTokenizer.from_pretrained(distilled_model_path)
 
-# Function to evaluate a model on a specific benchmark task
-def evaluate_model(model, tokenizer, benchmark_name, dataset_name, split_name):
-    # Load the dataset
-    dataset = load_dataset(dataset_name, split=split_name)
-    
-    # Setup evaluation pipeline (text classification for most tasks)
-    classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
-    
-    # Evaluate on the dataset - error handling if not named the correct thing
-    if "sentence1" in dataset.column_names:
-        input_data = dataset["sentence1"]
-    elif "text" in dataset.column_names:
-        input_data = dataset["text"]
+# Define task configurations for classification benchmarks
+task_configs = {
+    "SuperGLUE_cb": {
+        "prompt_template": "Premise: {premise} Hypothesis: {hypothesis} The relationship is",
+        "label_map": {0: "entailment", 1: "contradiction", 2: "neutral"},
+        "input_fields": ["premise", "hypothesis"]
+    },
+    "GLUE_mrpc": {
+        "prompt_template": "Sentence1: {sentence1} Sentence2: {sentence2} Are they equivalent or not equivalent? The answer is",
+        "label_map": {0: "not equivalent", 1: "equivalent"},
+        "input_fields": ["sentence1", "sentence2"]
+    },
+    "XTREME_XNLI": {
+        "prompt_template": "Premise: {premise} Hypothesis: {hypothesis} The relationship is",
+        "label_map": {0: "entailment", 1: "neutral", 2: "contradiction"},
+        "input_fields": ["premise", "hypothesis"]
+    },
+    "TREC": {
+        "prompt_template": "Classify this question: {text} into one of: abbreviation, entity, description, human, location, numeric. The category is",
+        "label_map": {0: "abbreviation", 1: "entity", 2: "description", 3: "human", 4: "location", 5: "numeric"},
+        "input_fields": ["text"]
+    }
+}
+
+# Define benchmarks (classification tasks only)
+benchmarks = [
+    {"name": "SuperGLUE_cb", "dataset": "super_glue", "config": "cb", "split": "validation"},
+    {"name": "GLUE_mrpc", "dataset": "glue", "config": "mrpc", "split": "validation"},
+    {"name": "XTREME_XNLI", "dataset": "xtreme", "config": "XNLI", "split": "test"},
+    {"name": "TREC", "dataset": "trec", "config": None, "split": "test"}
+]
+
+# Evaluation function
+def evaluate_model(model, tokenizer, benchmark, task_config):
+    """Evaluate a model on a benchmark task using zero-shot classification."""
+    # Load dataset
+    if benchmark["config"]:
+        dataset = load_dataset(benchmark["dataset"], benchmark["config"], split=benchmark["split"])
     else:
-        input_data = dataset[dataset.column_names[0]]
+        dataset = load_dataset(benchmark["dataset"], split=benchmark["split"])
 
-    results = classifier(input_data)
+    if benchmark["name"] == "XTREME_XNLI":
+        dataset = dataset.filter(lambda x: x["language"] == "en")
 
-    # Extract predicted labels and true labels
-    pred_labels = [result['label'] for result in results]
-    true_labels = dataset['label']
-    
-    # Calculate accuracy
-    accuracy = accuracy_score(true_labels, pred_labels)
-    
+    correct = 0
+    total = 0
+    for example in dataset:
+        # Construct prompt
+        input_data = {field: example[field] for field in task_config["input_fields"]}
+        prompt = task_config["prompt_template"].format(**input_data)
+        prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        # Get true label
+        true_label = example["label"]
+
+        # Compute loss for each verbalizer
+        losses = []
+        verbalizers = list(task_config["label_map"].values())
+        for verbalizer in verbalizers:
+            verbalizer_ids = tokenizer.encode(verbalizer, return_tensors="pt").to(device)
+            with torch.no_grad():
+                outputs = model(input_ids=prompt_ids, labels=verbalizer_ids)
+                loss = outputs.loss.item()  # Negative average log prob
+            losses.append(loss)
+
+        # Predict label with smallest loss (highest probability)
+        pred_idx = np.argmin(losses)
+        pred_label = list(task_config["label_map"].keys())[pred_idx]
+        if pred_label == true_label:
+            correct += 1
+        total += 1
+
+    accuracy = correct / total if total > 0 else 0
     return accuracy
 
-# Prepare to collect results
+# Collect results
 results_data = []
 
-# Iterate over all benchmark tasks and models
-for benchmark_name, dataset_name, split_name in benchmarks:
-    # Evaluate original model
-    original_accuracy = evaluate_model(teacher_model, teacher_tokenizer, benchmark_name, dataset_name, split_name)
-    
-    # Evaluate distilled model
-    distilled_accuracy = evaluate_model(distilled_model, distilled_tokenizer, benchmark_name, dataset_name, split_name)
-    
-    # Add results to list
-    results_data.append({
-        "Workload": benchmark_name,
-        "Original Model Accuracy": original_accuracy,
-        "Distilled Model Accuracy": distilled_accuracy,
-        "Remarks": "Performance comparison"
-    })
+# Evaluate both models on each benchmark
+for benchmark in benchmarks:
+    task_name = benchmark["name"]
+    if task_name in task_configs:
+        task_config = task_configs[task_name]
+        print(f"Evaluating {task_name}...")
+        
+        # Teacher model evaluation
+        teacher_accuracy = evaluate_model(teacher_model, teacher_tokenizer, benchmark, task_config)
+        
+        # Distilled model evaluation
+        distilled_accuracy = evaluate_model(distilled_model, distilled_tokenizer, benchmark, task_config)
+        
+        # Store results
+        results_data.append({
+            "Workload": task_name,
+            "Original Model Accuracy": teacher_accuracy,
+            "Distilled Model Accuracy": distilled_accuracy,
+            "Remarks": "Zero-shot classification performance"
+        })
+        print(f"{task_name} - Teacher Accuracy: {teacher_accuracy:.4f}, Distilled Accuracy: {distilled_accuracy:.4f}")
 
-# Convert results to a pandas DataFrame
+# Save results to CSV
 df = pd.DataFrame(results_data)
-
-# Save the results to a CSV file
 df.to_csv("benchmark_results.csv", index=False)
-
 print("Evaluation completed. Results saved to 'benchmark_results.csv'")
