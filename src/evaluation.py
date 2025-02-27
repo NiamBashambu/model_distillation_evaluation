@@ -19,7 +19,7 @@ benchmarks = [
 teacher_model_name = "EleutherAI/gpt-neo-1.3B"
 distilled_model_path = "./distilled_student_model"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_name, torch_dtype=torch.float16, device_map="auto")
+teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model_name, torch_dtype=torch.bfloat16, device_map="auto")
 teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_name)
 
 distilled_model = AutoModelForCausalLM.from_pretrained(distilled_model_path)
